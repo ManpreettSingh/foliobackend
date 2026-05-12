@@ -1,0 +1,119 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum AssetType {
+  STOCK
+  CRYPTO
+  ETF
+  MUTUAL_FUND
+  INDEX
+  COMMODITY
+}
+
+enum TransactionType {
+  BUY
+  SELL
+  DIVIDEND
+  SPLIT
+  FEE
+  EDIT
+}
+
+model User {
+  id           String        @id @default(cuid())
+  name         String
+  email        String        @unique
+  passwordHash String
+  portfolios   Portfolio[]
+  watchlist    Watchlist[]
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+}
+
+model Portfolio {
+  id           String        @id @default(cuid())
+  name         String
+  description  String?
+  baseCurrency String        @default("USD")
+  userId       String
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  holdings     Holding[]
+  transactions Transaction[]
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  @@index([userId])
+}
+
+model Asset {
+  id          String        @id @default(cuid())
+  symbol      String
+  name        String
+  type        AssetType
+  exchange    String?
+  currency    String        @default("USD")
+  sector      String?
+  region      String?
+  holdings    Holding[]
+  watchlists  Watchlist[]
+  transactions Transaction[]
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  @@unique([symbol, type])
+}
+
+model Holding {
+  id                   String        @id @default(cuid())
+  portfolioId          String
+  assetId              String
+  quantity             Decimal       @db.Decimal(24, 8)
+  averagePurchasePrice Decimal       @db.Decimal(24, 8)
+  purchaseDate         DateTime
+  notes                String?
+  portfolio            Portfolio     @relation(fields: [portfolioId], references: [id], onDelete: Cascade)
+  asset                Asset         @relation(fields: [assetId], references: [id])
+  transactions         Transaction[]
+  createdAt            DateTime      @default(now())
+  updatedAt            DateTime      @updatedAt
+
+  @@index([portfolioId])
+  @@index([assetId])
+}
+
+model Watchlist {
+  id        String   @id @default(cuid())
+  userId    String
+  assetId   String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  asset     Asset    @relation(fields: [assetId], references: [id])
+  createdAt DateTime @default(now())
+
+  @@unique([userId, assetId])
+  @@index([userId])
+}
+
+model Transaction {
+  id          String          @id @default(cuid())
+  portfolioId String
+  holdingId   String?
+  assetId     String
+  type        TransactionType
+  quantity    Decimal         @db.Decimal(24, 8)
+  price       Decimal         @db.Decimal(24, 8)
+  occurredAt  DateTime
+  notes       String?
+  portfolio   Portfolio       @relation(fields: [portfolioId], references: [id], onDelete: Cascade)
+  holding     Holding?        @relation(fields: [holdingId], references: [id], onDelete: SetNull)
+  asset       Asset           @relation(fields: [assetId], references: [id])
+  createdAt   DateTime        @default(now())
+
+  @@index([portfolioId])
+  @@index([assetId])
+}
