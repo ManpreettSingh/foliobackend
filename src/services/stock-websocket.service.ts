@@ -27,10 +27,16 @@ message PricingData {
 const root = protobuf.parse(PROTO_SCHEMA).root;
 const PricingData = root.lookupType("PricingData");
 
+const MAX_CLIENTS = 500;
+const MAX_SYMBOLS_PER_CLIENT = 50;
+const MAX_SYMBOL_LENGTH = 20;
+const MAX_MESSAGE_BYTES = 8 * 1024;
+
 export class StockWebSocketService {
   private static wss: WebSocketServer | null = null;
   private static yahooWs: WebSocket | null = null;
-  private static clientSubscriptions = new Map<WebSocket, Set<string>>();
+  // client -> (symbol the client asked for -> exact upstream Yahoo symbol it resolves to)
+  private static clientSubscriptions = new Map<WebSocket, Map<string, string>>();
   private static activeStockSymbols = new Set<string>();
   private static reconnectTimeout: NodeJS.Timeout | null = null;
   private static pollingTimer: NodeJS.Timeout | null = null;
@@ -38,27 +44,38 @@ export class StockWebSocketService {
   public static init(server: Server) {
     console.log("[StockWebSocketService] Initializing WebSocket Server on path /stocks...");
     
-    this.wss = new WebSocketServer({ noServer: true });
+    this.wss = new WebSocketServer({ noServer: true, maxPayload: MAX_MESSAGE_BYTES });
 
     server.on("upgrade", (request, socket, head) => {
-      const url = new URL(request.url || "", `http://${request.headers.host}`);
-      if (url.pathname === "/stocks") {
-        this.wss?.handleUpgrade(request, socket, head, (ws) => {
-          this.wss?.emit("connection", ws, request);
-        });
+      let pathname = "";
+      try {
+        pathname = new URL(request.url || "", `http://${request.headers.host}`).pathname;
+      } catch {
+        // malformed URL: fall through and reject below
       }
+
+      if (pathname !== "/stocks" || this.clientSubscriptions.size >= MAX_CLIENTS) {
+        // Don't leave unrelated or excess upgrade requests hanging open.
+        socket.destroy();
+        return;
+      }
+
+      this.wss?.handleUpgrade(request, socket, head, (ws) => {
+        this.wss?.emit("connection", ws, request);
+      });
     });
 
     this.wss.on("connection", (ws: WebSocket) => {
       console.log("[StockWebSocketService] Client connected.");
-      this.clientSubscriptions.set(ws, new Set());
+      this.clientSubscriptions.set(ws, new Map());
 
-      ws.on("message", (message: string) => {
+      ws.on("message", (message: WebSocket.RawData) => {
         try {
-          const payload = JSON.parse(message);
-          if (payload.type === "subscribe" && Array.isArray(payload.symbols)) {
-            this.handleSubscribe(ws, payload.symbols);
-          } else if (payload.type === "unsubscribe" && Array.isArray(payload.symbols)) {
+          const payload = JSON.parse(message.toString());
+          if (!Array.isArray(payload?.symbols)) return;
+          if (payload.type === "subscribe") {
+            void this.handleSubscribe(ws, payload.symbols);
+          } else if (payload.type === "unsubscribe") {
             this.handleUnsubscribe(ws, payload.symbols);
           }
         } catch (err) {
@@ -78,54 +95,55 @@ export class StockWebSocketService {
     });
   }
 
-  private static normalizeSymbol(symbol: string): string {
-    const s = symbol.toUpperCase().trim();
-    if (this.isCrypto(s)) return s;
-    if (s.includes(".") || s.includes("-") || s.includes("=")) return s;
-    if (s.startsWith("^")) return s;
-    
-    const usEquities = [
-      "AAPL", "MSFT", "NVDA", "GOOGL", "GOOG", "TSLA", "AMZN", "META", "NFLX", 
-      "AMD", "COIN", "VOO", "VTI", "VWRL", "QQQ", "GS", "JPM", "DIS", "V", "MA", 
-      "WMT", "PG", "JNJ", "INTC", "PYPL", "NKE", "SBUX"
-    ];
-    if (usEquities.includes(s)) return s;
-    return `${s}.NS`; // Fallback to NSE for Indian stocks
-  }
-
   private static isCrypto(symbol: string): boolean {
     const s = symbol.toUpperCase().trim();
     const knownCryptos = [
       "BTC", "ETH", "SOL", "ADA", "XRP", "DOT", "DOGE", "SHIB", "AVAX", "LINK", 
-      "MATIC", "LTC", "UNI", "XLM", "ATOM", "NEAR", "OP", "ARB", "RENDER", "RNDR",
+      "MATIC", "POL", "LTC", "UNI", "XLM", "ATOM", "NEAR", "OP", "ARB", "RENDER", "RNDR",
       "USDT", "USDC", "BNB", "TRX", "TON"
     ];
     return knownCryptos.includes(s) || s.endsWith("-USD") || s.endsWith("-INR");
   }
 
-  private static handleSubscribe(ws: WebSocket, symbols: string[]) {
+  private static async handleSubscribe(ws: WebSocket, symbols: unknown[]) {
     const subs = this.clientSubscriptions.get(ws);
     if (!subs) return;
 
-    symbols.forEach((symbol) => {
-      const normalized = this.normalizeSymbol(symbol);
-      subs.add(normalized);
-      // Keep track of the original symbol requested by the client too so we can check both
-      subs.add(symbol.toUpperCase().trim());
-      
-      console.log(`[StockWebSocketService] Subscribed client to ${symbol} (mapped to ${normalized})`);
-    });
+    const requested = symbols
+      .filter((s): s is string => typeof s === "string")
+      .map((s) => s.toUpperCase().trim())
+      .filter((s) => s.length > 0 && s.length <= MAX_SYMBOL_LENGTH && !subs.has(s));
+
+    for (const symbol of requested) {
+      if (subs.size >= MAX_SYMBOLS_PER_CLIENT) break;
+
+      // Resolve to ONE upstream symbol, the same way the REST quotes do. Subscribing to both
+      // "INFY" and "INFY.NS" streamed a USD and an INR price onto the same client key.
+      let resolved = symbol;
+      if (!this.isCrypto(symbol)) {
+        try {
+          resolved = ((await MarketDataService.resolveSymbol?.(symbol)) ?? symbol).toUpperCase();
+        } catch {
+          resolved = symbol;
+        }
+      }
+
+      // The client may have disconnected or hit the cap while we were resolving.
+      if (!this.clientSubscriptions.has(ws) || subs.size >= MAX_SYMBOLS_PER_CLIENT) break;
+      subs.set(symbol, resolved);
+      console.log(`[StockWebSocketService] Subscribed client to ${symbol} (mapped to ${resolved})`);
+    }
 
     this.recalculateActiveSymbols();
   }
 
-  private static handleUnsubscribe(ws: WebSocket, symbols: string[]) {
+  private static handleUnsubscribe(ws: WebSocket, symbols: unknown[]) {
     const subs = this.clientSubscriptions.get(ws);
     if (!subs) return;
 
     symbols.forEach((symbol) => {
+      if (typeof symbol !== "string") return;
       subs.delete(symbol.toUpperCase().trim());
-      subs.delete(this.normalizeSymbol(symbol));
       console.log(`[StockWebSocketService] Unsubscribed client from ${symbol}`);
     });
 
@@ -137,11 +155,9 @@ export class StockWebSocketService {
     this.activeStockSymbols.clear();
 
     this.clientSubscriptions.forEach((subs) => {
-      subs.forEach((sym) => {
-        const upper = sym.toUpperCase().trim();
-        if (!this.isCrypto(upper) && upper === this.normalizeSymbol(upper)) {
-          this.activeStockSymbols.add(upper);
-        }
+      subs.forEach((resolved, requested) => {
+        if (this.isCrypto(requested)) return;
+        this.activeStockSymbols.add(resolved);
       });
     });
 
@@ -202,6 +218,7 @@ export class StockWebSocketService {
             symbol: decoded.id.toUpperCase(),
             price: decoded.price,
             changePercent: decoded.changePercent,
+            currency: decoded.currency ? String(decoded.currency).toUpperCase() : undefined,
           };
 
           // Broadcast to matching clients
@@ -289,20 +306,18 @@ export class StockWebSocketService {
     }
   }
 
-  private static broadcastUpdate(update: { symbol: string; price: number; changePercent: number }) {
-    const rawSymbol = update.symbol.replace(".NS", "");
-    const messageStr = JSON.stringify({
-      type: "tick",
-      data: update,
-    });
+  private static broadcastUpdate(update: { symbol: string; price: number; changePercent: number; currency?: string }) {
+    const upstream = update.symbol.toUpperCase();
 
     this.clientSubscriptions.forEach((subs, ws) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        // Send if client explicitly subscribed to "RELIANCE.NS" OR "RELIANCE"
-        if (subs.has(update.symbol) || subs.has(rawSymbol)) {
-          ws.send(messageStr);
+      if (ws.readyState !== WebSocket.OPEN) return;
+      // Deliver only to clients whose requested symbol resolves to exactly this upstream symbol,
+      // labelled with the symbol they asked for so the client matches it unambiguously.
+      subs.forEach((resolved, requested) => {
+        if (resolved === upstream) {
+          ws.send(JSON.stringify({ type: "tick", data: { ...update, symbol: requested } }));
         }
-      }
+      });
     });
   }
 }

@@ -1,4 +1,5 @@
 import type { NextFunction, Request, Response } from "express";
+import jwt from "jsonwebtoken";
 import { prisma } from "../config/prisma.js";
 import { verifyToken } from "../utils/jwt.js";
 import { HttpError } from "../utils/http-error.js";
@@ -26,6 +27,17 @@ export async function requireAuth(req: Request, _res: Response, next: NextFuncti
     req.user = user;
     next();
   } catch (error) {
-    next(error instanceof HttpError ? error : new HttpError(401, "Invalid authentication token"));
+    if (error instanceof HttpError) return next(error);
+    if (error instanceof jwt.TokenExpiredError) {
+      return next(new HttpError(401, "Your session has expired. Please sign in again."));
+    }
+    if (error instanceof jwt.JsonWebTokenError) {
+      // Bad signature (token issued by a different JWT_SECRET/server) or malformed token.
+      console.warn(`[auth] Rejected token: ${error.message}`);
+      return next(new HttpError(401, "Invalid authentication token. Please sign in again."));
+    }
+    // Anything else (e.g. database unreachable) is a server problem, not a bad login.
+    console.error("[auth] Unexpected error while authenticating:", error);
+    next(new HttpError(503, "Could not verify your session right now. Please try again in a moment."));
   }
 }

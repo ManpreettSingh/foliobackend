@@ -8,6 +8,17 @@ export const registerSchema = z.object({
   }),
 });
 
+export const verifyRegisterSchema = z.object({
+  body: z.object({
+    email: z.string().trim().email(),
+    code: z.string().trim().regex(/^\d{6}$/, "Enter the 6-digit code from your email"),
+  }),
+});
+
+export const resendRegisterSchema = z.object({
+  body: z.object({ email: z.string().trim().email() }),
+});
+
 export const loginSchema = z.object({
   body: z.object({
     email: z.string().trim().email().toLowerCase(),

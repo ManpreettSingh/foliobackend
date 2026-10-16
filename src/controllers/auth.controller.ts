@@ -1,9 +1,28 @@
 import type { Request, Response } from "express";
-import { loginUser, registerUser, googleLoginOrRegister, updateProfile as updateProfileService } from "../services/auth.service.js";
+import {
+  loginUser,
+  startRegistration,
+  resendRegistrationCode,
+  verifyRegistration,
+  googleLoginOrRegister,
+  updateProfile as updateProfileService,
+} from "../services/auth.service.js";
 
+// Sign-up is two steps: this emails a code (202 = accepted, not created yet)...
 export async function register(req: Request, res: Response) {
-  const result = await registerUser(req.body);
+  const result = await startRegistration(req.body);
+  res.status(202).json(result);
+}
+
+// ...and this checks it, creates the account and returns the session token.
+export async function verifyRegister(req: Request, res: Response) {
+  const result = await verifyRegistration(req.body);
   res.status(201).json(result);
+}
+
+export async function resendRegisterCode(req: Request, res: Response) {
+  const result = await resendRegistrationCode(req.body.email);
+  res.json(result);
 }
 
 export async function login(req: Request, res: Response) {

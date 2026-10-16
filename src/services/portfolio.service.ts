@@ -1,6 +1,7 @@
 import type { AssetType } from "@prisma/client";
 import { prisma } from "../config/prisma.js";
 import { HttpError } from "../utils/http-error.js";
+import { convertCurrency } from "../config/fx.js";
 import { getLatestPrice, getLatestPrices } from "./price.service.js";
 
 async function assertPortfolioOwner(portfolioId: string, userId: string) {
@@ -11,6 +12,10 @@ async function assertPortfolioOwner(portfolioId: string, userId: string) {
 
 function toNumber(value: unknown) {
   return Number(value);
+}
+
+function toUsd(value: number, currency?: string | null): number {
+  return convertCurrency(value, currency, "USD");
 }
 
 export async function listPortfolios(userId: string) {
@@ -50,7 +55,9 @@ export async function addHolding(
 ) {
   await assertPortfolioOwner(portfolioId, userId);
 
-  let currency = "USD";
+  // Only overwrite the stored currency when the quote actually reports one.
+  // A failed quote must not replace a known INR asset with the USD default.
+  let currency: string | undefined;
   try {
     const quote = await getLatestPrice(input.symbol);
     if (quote && quote.currency) {
@@ -62,8 +69,8 @@ export async function addHolding(
 
   const asset = await prisma.asset.upsert({
     where: { symbol_type: { symbol: input.symbol, type: input.assetType } },
-    create: { symbol: input.symbol, name: input.name, type: input.assetType, currency },
-    update: { name: input.name, currency },
+    create: { symbol: input.symbol, name: input.name, type: input.assetType, currency: currency ?? "USD" },
+    update: { name: input.name, ...(currency ? { currency } : {}) },
   });
 
   // Check if holding already exists for this asset in the portfolio
@@ -159,20 +166,21 @@ export async function updateHolding(
 
 export async function deleteHolding(userId: string, portfolioId: string, holdingId: string) {
   await assertPortfolioOwner(portfolioId, userId);
-  const holding = await prisma.holding.findFirst({ where: { id: holdingId } });
-  if (holding) {
-    await prisma.transaction.create({
-      data: {
-        portfolioId,
-        assetId: holding.assetId,
-        type: "SELL",
-        quantity: holding.quantity,
-        price: holding.averagePurchasePrice,
-        occurredAt: new Date(),
-        notes: "Removed from portfolio"
-      }
-    });
-  }
+  // Scope to the verified portfolio so one user cannot delete another user's holding.
+  const holding = await prisma.holding.findFirst({ where: { id: holdingId, portfolioId } });
+  if (!holding) throw new HttpError(404, "Holding not found");
+
+  await prisma.transaction.create({
+    data: {
+      portfolioId,
+      assetId: holding.assetId,
+      type: "SELL",
+      quantity: holding.quantity,
+      price: holding.averagePurchasePrice,
+      occurredAt: new Date(),
+      notes: "Removed from portfolio"
+    }
+  });
   await prisma.holding.delete({ where: { id: holdingId } });
 }
 
@@ -197,7 +205,8 @@ export async function getDashboard(userId: string) {
     const quantity = toNumber(holding.quantity);
     const avgPrice = toNumber(holding.averagePurchasePrice);
     const quote = quoteMap.get(holding.asset.symbol);
-    const currentPrice = quote?.price ?? avgPrice;
+    // A failed lookup yields price 0; treat that as "no price" instead of a worthless holding.
+    const currentPrice = quote && quote.price > 0 ? quote.price : avgPrice;
 
     // Auto-update asset currency in background if quote has a valid currency
     if (quote && quote.currency && holding.asset.currency !== quote.currency) {
@@ -208,14 +217,20 @@ export async function getDashboard(userId: string) {
       }).catch((err) => console.error(`Failed to update asset currency in bg for ${holding.asset.symbol}:`, err));
     }
 
+    const assetCurrency = holding.asset.currency || "USD";
+
     const invested = quantity * avgPrice;
     const currentValue = quantity * currentPrice;
     const unrealizedProfitLoss = currentValue - invested;
-    investedAmount += invested;
-    totalPortfolioValue += currentValue;
-    todaysGainLoss += currentValue * ((quote?.changePercent ?? 0) / 100);
-    allocation.set(holding.asset.type, (allocation.get(holding.asset.type) ?? 0) + currentValue);
-    return { ...holding, currentPrice, invested, currentValue, unrealizedProfitLoss };
+    // Normalize to USD so cross-currency aggregation (summary, allocation) is correct
+    const investedUsd = toUsd(invested, assetCurrency);
+    const currentValueUsd = toUsd(currentValue, assetCurrency);
+    const unrealizedPLUsd = currentValueUsd - investedUsd;
+    investedAmount += investedUsd;
+    totalPortfolioValue += currentValueUsd;
+    todaysGainLoss += currentValueUsd * ((quote?.changePercent ?? 0) / 100);
+    allocation.set(holding.asset.type, (allocation.get(holding.asset.type) ?? 0) + currentValueUsd);
+    return { ...holding, currentPrice, invested: investedUsd, currentValue: currentValueUsd, unrealizedProfitLoss: unrealizedPLUsd };
   });
 
   const latestTransactions = await prisma.transaction.findMany({

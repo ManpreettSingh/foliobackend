@@ -148,68 +148,93 @@ You MUST follow this exact structure with these exact headings. Do not invent ot
 `;
 
   // Try multiple models in order of preference (fallback for rate limits)
-  const models = [
-    "gemini-2.5-flash",
+  // Google retires models regularly (2.0 / 2.5 / 1.5 now return 404), so keep a list of current ones
+  // and fall through it. Override with GEMINI_MODELS="model-a,model-b" without a code change.
+  const models = (process.env.GEMINI_MODELS?.split(",").map((m) => m.trim()).filter(Boolean)) ?? [
+    "gemini-3.5-flash",
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.1-flash-lite",
     "gemini-flash-latest",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
-    "gemini-1.5-flash-8b",
   ];
 
-  let lastError = "";
+  const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  let busy = false; // saw 429/503: worth retrying later
+  let invalidKey = false;
+  const details: string[] = [];
 
   for (const model of models) {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
-    try {
-      console.log(`[AI Report] Trying model: ${model}...`);
+    // One quick retry per model: 503 "high demand" spikes are usually brief.
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        console.log(`[AI Report] Trying model: ${model} (attempt ${attempt})...`);
 
-      const response = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: {
-            temperature: 0.7,
-            maxOutputTokens: 8192,
-            topP: 0.9,
-          },
-        }),
-      });
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: {
+              temperature: 0.7,
+              maxOutputTokens: 8192,
+              topP: 0.9,
+            },
+          }),
+        });
 
-      if (response.status === 429) {
-        const errorBody = await response.text();
-        console.warn(`[AI Report] Model ${model} rate limited (429). Trying next model...`);
-        lastError = `Rate limit exceeded for ${model}. `;
-        continue; // try next model
+        if (response.status === 429 || response.status === 503) {
+          busy = true;
+          details.push(`${model}: ${response.status}`);
+          console.warn(`[AI Report] Model ${model} busy (${response.status}).`);
+          if (attempt === 1) {
+            await wait(1500);
+            continue; // retry same model once
+          }
+          break; // then try next model
+        }
+
+        if (!response.ok) {
+          const errorBody = await response.text();
+          console.error(`[AI Report] Model ${model} error:`, response.status, errorBody);
+          if (response.status === 401 || response.status === 403 || response.status === 400 && /API key/i.test(errorBody)) {
+            invalidKey = true;
+          }
+          details.push(`${model}: ${response.status}`);
+          break; // 404 (retired model) etc.: move on to the next model
+        }
+
+        const result = await response.json();
+
+        // Newer models can return several parts (e.g. thinking + answer): join the text parts.
+        const parts: Array<{ text?: string; thought?: boolean }> = result?.candidates?.[0]?.content?.parts ?? [];
+        const text = parts.filter((p) => p.text && !p.thought).map((p) => p.text).join("").trim();
+
+        if (!text) {
+          details.push(`${model}: empty response`);
+          break;
+        }
+
+        console.log(`[AI Report] Successfully generated report using ${model} (${text.length} chars)`);
+        return text;
+      } catch (err: any) {
+        console.error(`[AI Report] Model ${model} fetch error:`, err.message);
+        details.push(`${model}: ${err.message}`);
+        break;
       }
-
-      if (!response.ok) {
-        const errorBody = await response.text();
-        console.error(`[AI Report] Model ${model} error:`, response.status, errorBody);
-        lastError = `${model} returned ${response.status}. `;
-        continue; // try next model
-      }
-
-      const result = await response.json();
-
-      const text =
-        result?.candidates?.[0]?.content?.parts?.[0]?.text ??
-        "Unable to generate report. The AI model returned an empty response.";
-
-      console.log(`[AI Report] Successfully generated report using ${model} (${text.length} chars)`);
-      return text;
-    } catch (err: any) {
-      console.error(`[AI Report] Model ${model} fetch error:`, err.message);
-      lastError = `${model}: ${err.message}. `;
-      continue;
     }
+
+    if (invalidKey) break; // no point trying other models with a rejected key
   }
 
-  // All models failed
-  throw new Error(
-    `All Gemini models exhausted. ${lastError}This is usually a rate limit issue with Google's free tier. ` +
-    `Please wait a few minutes and try again, or upgrade your Gemini API plan at https://ai.google.dev/pricing`
-  );
+  // All models failed: report the real reason instead of always blaming rate limits.
+  const message = invalidKey
+    ? "The Gemini API key was rejected. Check GEMINI_API_KEY in the backend .env."
+    : busy
+      ? "The AI service is busy right now. Please try again in a minute."
+      : "No available Gemini model could generate the report. Set GEMINI_MODELS in the backend .env to a current model name.";
+  console.error(`[AI Report] All models failed: ${details.join("; ")}`);
+  throw Object.assign(new Error(message), { statusCode: invalidKey ? 503 : busy ? 503 : 502 });
 }
 

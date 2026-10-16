@@ -49,6 +49,8 @@ interface MarketDataProvider {
   getQuotes(symbols: string[], bypassCache?: boolean): Promise<PriceQuote[]>;
   searchAssets(query: string): Promise<AssetSearchResult[]>;
   getHistory(symbol: string, days: number): Promise<HistoryPoint[]>;
+  /** Map a user-facing symbol to the exact symbol the upstream feed uses (e.g. RELIANCE -> RELIANCE.NS). */
+  resolveSymbol?(symbol: string): Promise<string>;
 }
 
 // ─── Market Hours Check ────────────────────────────────────────────────
@@ -58,7 +60,7 @@ export function isMarketOpen(symbol: string): boolean {
   // 1. Crypto is open 24/7
   const knownCryptos = [
     "BTC", "ETH", "SOL", "ADA", "XRP", "DOT", "DOGE", "SHIB", "AVAX", "LINK", 
-    "MATIC", "LTC", "UNI", "XLM", "ATOM", "NEAR", "OP", "ARB", "RENDER", "RNDR",
+    "MATIC", "POL", "LTC", "UNI", "XLM", "ATOM", "NEAR", "OP", "ARB", "RENDER", "RNDR",
     "USDT", "USDC", "BNB", "TRX", "TON"
   ];
   const isCrypto = knownCryptos.includes(upper) || upper.endsWith("-USD") || upper.endsWith("-INR");
@@ -203,6 +205,14 @@ class StubProvider implements MarketDataProvider {
   }
 }
 
+// "BTC-INR" -> { base: "BTC", currency: "INR" }; plain "BTC" and "BTC-USD" are quoted in USD.
+function splitCryptoSymbol(symbol: string): { base: string; currency: "USD" | "INR" } {
+  const upper = symbol.toUpperCase().trim();
+  if (upper.endsWith("-INR")) return { base: upper.slice(0, -4), currency: "INR" };
+  if (upper.endsWith("-USD")) return { base: upper.slice(0, -4), currency: "USD" };
+  return { base: upper, currency: "USD" };
+}
+
 // ─── CoinGecko Provider ───────────────────────────────────────────────
 class CoinGeckoProvider implements MarketDataProvider {
   private apiKey: string;
@@ -225,7 +235,9 @@ class CoinGeckoProvider implements MarketDataProvider {
     ["XRP", "ripple"],
     ["LINK", "chainlink"],
     ["AVAX", "avalanche-2"],
-    ["MATIC", "matic-network"],
+    // Polygon migrated MATIC -> POL; the old "matic-network" id is frozen at a stale price.
+    ["MATIC", "polygon-ecosystem-token"],
+    ["POL", "polygon-ecosystem-token"],
     ["SHIB", "shiba-inu"],
     ["LTC", "litecoin"],
     ["UNI", "uniswap"],
@@ -307,7 +319,7 @@ class CoinGeckoProvider implements MarketDataProvider {
     const ids: string[] = [];
     const validSymbolsToFetch: string[] = [];
     for (const symbol of symbolsToFetch) {
-      const id = await this.resolveId(symbol);
+      const id = await this.resolveId(splitCryptoSymbol(symbol).base);
       if (id) {
         ids.push(id);
         validSymbolsToFetch.push(symbol);
@@ -323,7 +335,7 @@ class CoinGeckoProvider implements MarketDataProvider {
 
     if (ids.length > 0) {
       try {
-        const url = `${this.baseUrl}/simple/price?ids=${ids.join(",")}&vs_currencies=inr&include_24hr_change=true`;
+        const url = `${this.baseUrl}/simple/price?ids=${ids.join(",")}&vs_currencies=usd,inr&include_24hr_change=true`;
         const res = await fetch(url, { headers: this.headers });
         if (!res.ok) {
           throw new Error(`CoinGecko getQuotes failed: ${res.status} ${res.statusText}`);
@@ -332,13 +344,16 @@ class CoinGeckoProvider implements MarketDataProvider {
         
         for (const symbol of validSymbolsToFetch) {
           const upper = symbol.toUpperCase();
-          const id = Array.from(this.symbolToIdMap.entries()).find(([sym]) => sym === upper)?.[1];
+          const { base, currency } = splitCryptoSymbol(upper);
+          const key = currency.toLowerCase();
+          const id = this.symbolToIdMap.get(base);
           const priceData = id ? data[id] : null;
           const quote: PriceQuote = {
             symbol: upper,
-            price: priceData?.inr ?? 0,
-            changePercent: priceData?.inr_24h_change ?? 0,
-            asOf: new Date().toISOString()
+            price: priceData?.[key] ?? 0,
+            changePercent: priceData?.[`${key}_24h_change`] ?? 0,
+            asOf: new Date().toISOString(),
+            currency,
           };
           this.priceCache.set(upper, { quote, timestamp: now });
           results.push(quote);
@@ -378,14 +393,15 @@ class CoinGeckoProvider implements MarketDataProvider {
     }
     console.log(`[Cache MISS] History for ${upper} (${days}d)`);
 
-    const id = await this.resolveId(symbol);
+    const { base, currency } = splitCryptoSymbol(symbol);
+    const id = await this.resolveId(base);
     if (!id) {
       console.error(`Could not resolve CoinGecko ID for ${symbol}`);
       return [];
     }
 
     try {
-      const url = `${this.baseUrl}/coins/${id}/market_chart?vs_currency=inr&days=${days}`;
+      const url = `${this.baseUrl}/coins/${id}/market_chart?vs_currency=${currency.toLowerCase()}&days=${days}`;
       const res = await fetch(url, { headers: this.headers });
       if (!res.ok) {
         throw new Error(`CoinGecko getHistory failed: ${res.status} ${res.statusText}`);
@@ -467,6 +483,10 @@ class YahooFinanceProvider implements MarketDataProvider {
         return upper;
       }
     }
+  }
+
+  async resolveSymbol(symbol: string): Promise<string> {
+    return this.resolveYahooSymbol(symbol);
   }
 
   private fallbackQuote(symbol: string): PriceQuote {
@@ -639,7 +659,7 @@ class HybridProvider implements MarketDataProvider {
 
   private isCrypto(symbol: string): boolean {
     const s = symbol.toUpperCase().trim();
-    const knownCryptos = ["BTC", "ETH", "SOL", "DOGE", "ADA", "DOT", "XRP", "LINK", "AVAX", "MATIC", "SHIB", "LTC", "UNI", "XLM", "ATOM"];
+    const knownCryptos = ["BTC", "ETH", "SOL", "DOGE", "ADA", "DOT", "XRP", "LINK", "AVAX", "MATIC", "POL", "SHIB", "LTC", "UNI", "XLM", "ATOM"];
     return knownCryptos.includes(s) || s.endsWith("-USD") || s.endsWith("-INR");
   }
 
@@ -689,6 +709,11 @@ class HybridProvider implements MarketDataProvider {
       return this.cryptoProvider.getHistory(symbol, days);
     }
     return this.stockProvider.getHistory(symbol, days);
+  }
+
+  async resolveSymbol(symbol: string): Promise<string> {
+    if (this.isCrypto(symbol)) return symbol.toUpperCase().trim();
+    return this.stockProvider.resolveSymbol ? this.stockProvider.resolveSymbol(symbol) : symbol.toUpperCase().trim();
   }
 }
 

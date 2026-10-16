@@ -1,5 +1,6 @@
 import type { Request, Response, NextFunction } from "express";
 import { getDashboard } from "../services/portfolio.service.js";
+import { convertCurrency } from "../config/fx.js";
 import { generatePortfolioReport, type PortfolioReportInput } from "../services/ai.service.js";
 
 /**
@@ -21,16 +22,21 @@ export async function generateReport(req: Request, res: Response, next: NextFunc
     }
 
     // 2. Build structured input for AI
+    // Dashboard aggregates are USD-normalized; report displays in INR
+    const toInr = (usd: number) => convertCurrency(usd, "USD", "INR");
+
     const allocationByClass: Record<string, number> = {};
     const allocationBySector: Record<string, number> = {};
     const allocationByRegion: Record<string, number> = {};
 
     const holdings = dashboard.holdings.map((h) => {
       const quantity = Number(h.quantity);
-      const avgPrice = Number(h.averagePurchasePrice);
-      const currentValue = h.currentValue;
-      const invested = h.invested;
-      const unrealizedPL = h.unrealizedProfitLoss;
+      // Prices are in the asset's own currency; the report is in INR, so convert them too.
+      const avgPrice = convertCurrency(Number(h.averagePurchasePrice), h.asset.currency, "INR");
+      const currentPrice = convertCurrency(h.currentPrice, h.asset.currency, "INR");
+      const currentValue = toInr(h.currentValue);
+      const invested = toInr(h.invested);
+      const unrealizedPL = toInr(h.unrealizedProfitLoss);
       const returnPct = invested > 0 ? (unrealizedPL / invested) * 100 : 0;
       const type = h.asset.type;
       const sector = h.asset.sector || inferSectorSimple(h.asset.symbol, h.asset.name, type);
@@ -47,7 +53,7 @@ export async function generateReport(req: Request, res: Response, next: NextFunc
         type,
         quantity,
         avgPrice,
-        currentPrice: h.currentPrice,
+        currentPrice,
         invested,
         currentValue,
         unrealizedPL,
@@ -58,10 +64,10 @@ export async function generateReport(req: Request, res: Response, next: NextFunc
     });
 
     const reportInput: PortfolioReportInput = {
-      totalValue: dashboard.totalPortfolioValue,
-      totalInvested: dashboard.investedAmount,
-      todaysGainLoss: dashboard.todaysGainLoss,
-      overallPL: dashboard.totalPortfolioValue - dashboard.investedAmount,
+      totalValue: toInr(dashboard.totalPortfolioValue),
+      totalInvested: toInr(dashboard.investedAmount),
+      todaysGainLoss: toInr(dashboard.todaysGainLoss),
+      overallPL: toInr(dashboard.totalPortfolioValue - dashboard.investedAmount),
       overallPLPct:
         dashboard.investedAmount > 0
           ? ((dashboard.totalPortfolioValue - dashboard.investedAmount) / dashboard.investedAmount) * 100
@@ -83,10 +89,9 @@ export async function generateReport(req: Request, res: Response, next: NextFunc
     if (msg.includes("GEMINI_API_KEY")) {
       return res.status(503).json({ error: "Gemini API key not configured. Please add GEMINI_API_KEY to backend .env file." });
     }
-    if (msg.includes("rate limit") || msg.includes("quota") || msg.includes("429") || msg.includes("exhausted")) {
-      return res.status(429).json({
-        error: "AI report generation is temporarily rate-limited. Please wait 1-2 minutes and try again."
-      });
+    // The AI service already produces a user-facing message and status for model failures.
+    if (typeof err.statusCode === "number") {
+      return res.status(err.statusCode).json({ error: msg });
     }
     console.error("[AI Report] Error:", msg);
     return res.status(500).json({ error: "Failed to generate report. Please try again in a moment." });
