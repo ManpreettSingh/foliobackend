@@ -13,6 +13,11 @@ import { watchlistRouter } from "./routes/watchlist.routes.js";
 export function createApp() {
   const app = express();
 
+  // In production the API sits behind one reverse proxy (Railway). Trust it so req.ip is the real
+  // visitor, otherwise every user shares the proxy's address and the rate limits (login, report)
+  // would lock everyone out together.
+  if (env.NODE_ENV === "production") app.set("trust proxy", 1);
+
   app.use(helmet());
   app.use(cors({ origin: env.CORS_ORIGIN.split(",").map((origin) => origin.trim()), credentials: true }));
   app.use(express.json({ limit: "1mb" }));
